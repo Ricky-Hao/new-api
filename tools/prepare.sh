@@ -4,7 +4,7 @@ set -euo pipefail
 maintenance_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 application="$maintenance_root/.work/application"
 
-python3 "$maintenance_root/tools/patchset.py" generate --target "$application" "$@"
+python3 "$maintenance_root/tools/patchset.py" branch --target "$application" "$@"
 
 for cache in "${GOCACHE:-}" "${GOMODCACHE:-}" "${BUN_INSTALL_CACHE_DIR:-}"; do
   if [[ -n "$cache" ]]; then

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import patchset
 
@@ -38,7 +39,8 @@ class PatchsetTests(unittest.TestCase):
         self.git('commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD').decode().strip()
         self.manifest = {'format': 1, 'upstream': str(self.target),
-                         'base': self.base, 'patches': []}
+                         'base': self.base, 'patches': [],
+                         'application': {'ref': self.base, 'branch': f'upstream-{self.base[:9]}'}}
         self.add_patch('first', 'base', 'first')
         self.add_patch('second', 'first', 'second', ['first'])
         self.save()
@@ -74,14 +76,303 @@ class PatchsetTests(unittest.TestCase):
     def save(self):
         (self.root / 'manifest.json').write_text(json.dumps(self.manifest))
 
-    def cli(self, action, *args, target=None):
-        return subprocess.run([sys.executable, str(CLI), '--root', str(self.root), action,
+    def cli(self, action, *args, target=None, root=None):
+        return subprocess.run([sys.executable, str(CLI), '--root', str(root or self.root), action,
                                '--target', str(target or self.target), *args],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def assert_clean(self):
         self.assertEqual(self.git('status', '--porcelain'), b'')
         self.assertEqual((self.target / 'file.txt').read_text(), 'base\n')
+
+    def maintenance_git(self, *args):
+        return subprocess.check_output(['git', '-C', str(self.root), *args], stderr=subprocess.PIPE)
+
+    def branch_fixture(self):
+        self.write('.github/workflows/release.yml',
+                   'name: QuantumNous new-api release\non: [push, workflow_dispatch]\n')
+        self.git('add', '.github')
+        self.git('commit', '-qm', 'upstream workflows')
+        self.base = self.git('rev-parse', 'HEAD').decode().strip()
+        self.manifest.update(base=self.base,
+                             application={'ref': self.base, 'branch': f'upstream-{self.base[:9]}'})
+        self.save()
+        self.maintenance_git('init', '-q')
+        self.maintenance_git('config', 'user.name', 'Patchset test')
+        self.maintenance_git('config', 'user.email', 'test@example.invalid')
+        self.maintenance_git('config', 'commit.gpgsign', 'false')
+        self.maintenance_git('add', '.')
+        self.maintenance_git('commit', '-qm', 'maintenance catalog')
+        return self.target.parent / 'version-worktree'
+
+    def test_branch_has_ordered_implementation_commits_and_inactive_upstream_workflows(self):
+        generated = self.branch_fixture()
+        maintenance_head = self.maintenance_git('rev-parse', 'HEAD')
+        (self.root / 'human.txt').write_text('staged maintenance work\n')
+        self.maintenance_git('add', 'human.txt')
+        maintenance_status = self.maintenance_git('status', '--porcelain')
+        result = self.cli('branch', target=generated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((generated / '.git').is_file())
+        name = self.manifest['application']['branch']
+        self.assertEqual(patchset.git(generated, 'symbolic-ref', '--short', 'HEAD').decode().strip(), name)
+        commits = self.maintenance_git('rev-list', '--reverse', f'{self.base}..{name}').decode().splitlines()
+        self.assertEqual(len(commits), 3)
+        self.assertEqual(self.maintenance_git('show', f'{commits[0]}:file.txt'), b'first\n')
+        self.assertEqual(self.maintenance_git('show', f'{commits[1]}:file.txt'), b'second\n')
+        self.assertEqual((generated / 'file.txt').read_text(), 'second\n')
+        self.assertFalse((generated / '.github/workflows').exists())
+        self.assertEqual((generated / '.github/upstream-workflows/release.yml').read_bytes(),
+                         self.git('show', 'HEAD:.github/workflows/release.yml'))
+        message = self.maintenance_git('show', '-s', '--format=%B', name).decode()
+        self.assertIn(f'Upstream-Base: {self.base}', message)
+        self.assertIn('Patchset-Source:', message)
+        self.assertEqual(patchset.git(generated, 'status', '--porcelain'), b'')
+        self.assertEqual(self.maintenance_git('rev-parse', 'HEAD'), maintenance_head)
+        self.assertEqual(self.maintenance_git('status', '--porcelain'), maintenance_status)
+        self.assert_clean()
+
+    def test_branch_rebuilds_same_commits_and_reuses_only_matching_existing_branch(self):
+        generated = self.branch_fixture()
+        self.assertEqual(self.cli('branch', target=generated).returncode, 0)
+        head = patchset.git(generated, 'rev-parse', 'HEAD')
+        for action in ('branch', 'verify', 'test'):
+            result = self.cli(action, target=generated)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        other_target = generated.with_name('already-checked-out')
+        result = self.cli('branch', target=other_target)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('worktree', result.stderr)
+        self.assertFalse(other_target.exists())
+        independent = self.root.with_name('fresh-maintenance')
+        subprocess.run(['git', 'clone', '-q', '--no-hardlinks', str(self.root), str(independent)], check=True)
+        fresh_target = generated.with_name('fresh-version-worktree')
+        result = subprocess.run([sys.executable, str(CLI), '--root', str(independent), 'branch',
+                                 '--target', str(fresh_target), '--source', str(self.target)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(patchset.git(fresh_target, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(patchset.git(generated, 'rev-parse', 'HEAD'), head)
+
+    def test_branch_preserves_user_index_worktree_untracked_files_and_commits(self):
+        generated = self.branch_fixture()
+        self.assertEqual(self.cli('branch', target=generated).returncode, 0)
+        (generated / 'file.txt').write_text('user staged\n')
+        patchset.git(generated, 'add', 'file.txt')
+        (generated / 'file.txt').write_text('user unstaged\n')
+        (generated / 'untracked.txt').write_text('user untracked\n')
+        status = patchset.git(generated, 'status', '--porcelain')
+        head = patchset.git(generated, 'rev-parse', 'HEAD')
+        for action in ('branch', 'verify'):
+            result = self.cli(action, target=generated)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('user changes', result.stderr)
+        self.assertEqual(patchset.git(generated, 'status', '--porcelain'), status)
+        self.assertEqual(patchset.git(generated, 'show', ':file.txt'), b'user staged\n')
+        self.assertEqual((generated / 'file.txt').read_text(), 'user unstaged\n')
+        self.assertEqual((generated / 'untracked.txt').read_text(), 'user untracked\n')
+        self.assertEqual(patchset.git(generated, 'rev-parse', 'HEAD'), head)
+
+    def test_branch_collision_and_old_detached_checkout_are_never_overwritten(self):
+        generated = self.branch_fixture()
+        name = self.manifest['application']['branch']
+        self.maintenance_git('branch', name)
+        before = self.maintenance_git('rev-parse', name)
+        result = self.cli('branch', target=generated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Existing branch', result.stderr)
+        self.assertEqual(self.maintenance_git('rev-parse', name), before)
+        self.assertFalse(generated.exists())
+        self.assertEqual(self.cli('apply').returncode, 0)
+        status = self.git('status', '--porcelain')
+        result = self.cli('branch')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not an application worktree', result.stderr)
+        self.assertEqual(self.git('status', '--porcelain'), status)
+
+    def test_branch_rejects_unrecorded_user_commit_even_with_unchanged_tree(self):
+        generated = self.branch_fixture()
+        self.assertEqual(self.cli('branch', target=generated).returncode, 0)
+        patchset.git(generated, 'commit', '--allow-empty', '-qm', 'user commit')
+        head = patchset.git(generated, 'rev-parse', 'HEAD')
+        for action in ('branch', 'verify'):
+            result = self.cli(action, target=generated)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Application commit differs', result.stderr)
+        self.assertEqual(patchset.git(generated, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(patchset.git(generated, 'status', '--porcelain'), b'')
+
+    def test_branch_refuses_archive_collision_and_partial_patch_selection(self):
+        generated = self.branch_fixture()
+        result = self.cli('branch', '--only', 'first', target=generated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('complete manifest', result.stderr)
+        self.write('.github/upstream-workflows/release.yml', 'existing upstream file\n')
+        self.git('add', '.github')
+        self.git('commit', '-qm', 'existing archive path')
+        self.base = self.git('rev-parse', 'HEAD').decode().strip()
+        self.manifest.update(base=self.base,
+                             application={'ref': self.base, 'branch': f'upstream-{self.base[:9]}'})
+        self.save()
+        result = self.cli('branch', target=generated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('archive collision', result.stderr)
+        self.assertFalse(generated.exists())
+        self.assertEqual(self.maintenance_git('branch', '--list', self.manifest['application']['branch']), b'')
+        self.assertEqual((self.target / '.github/upstream-workflows/release.yml').read_text(),
+                         'existing upstream file\n')
+
+    def test_exact_release_ref_is_verified_and_misleading_version_names_are_refused(self):
+        generated = self.branch_fixture()
+        self.git('tag', '-a', 'v1.2.3-rc.1', '-m', 'release fixture')
+        self.manifest['application'] = {'ref': 'refs/tags/v1.2.3-rc.1', 'branch': 'v1.2.3-rc.1'}
+        self.save()
+        result = self.cli('branch', target=generated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.git('commit', '--allow-empty', '-qm', 'not selected release')
+        self.git('tag', 'v1.2.4')
+        self.manifest['application'] = {'ref': 'refs/tags/v1.2.4', 'branch': 'v1.2.4'}
+        self.save()
+        result = self.cli('branch', target=generated.with_name('wrong-release'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not resolve to fixed base', result.stderr)
+        self.assertEqual(self.maintenance_git('branch', '--list', 'v1.2.4'), b'')
+        self.manifest['application'] = {'ref': self.base, 'branch': 'v1.2.3-rc.1'}
+        self.save()
+        result = self.cli('branch', target=generated.with_name('misnamed'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Application branch must match', result.stderr)
+
+    def release_fixture(self, annotated=True):
+        generated = self.branch_fixture()
+        tag = 'v1.2.3-rc.1'
+        self.git('tag', *(['-a', tag, '-m', 'release fixture'] if annotated else [tag]))
+        self.git('tag', 'v9.9.9')
+        self.manifest['application'] = {'ref': f'refs/tags/{tag}', 'branch': tag}
+        self.save()
+        self.maintenance_git('add', 'manifest.json')
+        self.maintenance_git('commit', '-qm', 'select release fixture')
+        return generated, tag
+
+    def release_lifecycle(self, annotated):
+        generated, tag = self.release_fixture(annotated)
+        ref = f'refs/tags/{tag}'
+        tag_object = self.git('rev-parse', ref)
+        self.assertEqual(self.maintenance_git('tag', '--list'), b'')
+        result = self.cli('branch', target=generated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.maintenance_git('rev-parse', ref), tag_object)
+        self.assertEqual(self.maintenance_git('tag', '--list').decode().splitlines(), [tag])
+        head = patchset.git(generated, 'rev-parse', 'HEAD')
+        for action in ('verify', 'branch', 'test'):
+            with self.subTest(action=action):
+                result = self.cli(action, target=generated)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if action == 'test':
+                    self.assertEqual(result.stdout.count('RUN: content contract'), 1)
+        self.assertEqual(patchset.git(generated, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(patchset.git(generated, 'status', '--porcelain'), b'')
+        self.assertEqual(self.maintenance_git('status', '--porcelain'), b'')
+
+        fresh = self.root.with_name('release-maintenance-clone')
+        subprocess.run(['git', 'clone', '-q', '--no-tags', '--no-hardlinks', str(self.root), str(fresh)],
+                       check=True)
+        self.assertEqual(patchset.git(fresh, 'tag', '--list'), b'')
+        rebuilt = generated.with_name('rebuilt-release')
+        result = self.cli('branch', '--source', str(self.target), target=rebuilt, root=fresh)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for action in ('branch', 'verify', 'test'):
+            result = self.cli(action, target=rebuilt, root=fresh)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(patchset.git(rebuilt, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(patchset.git(rebuilt, 'rev-parse', ref), tag_object)
+
+    def test_annotated_release_branch_can_be_reused_verified_and_tested(self):
+        self.release_lifecycle(annotated=True)
+
+    def test_lightweight_release_branch_can_be_reused_verified_and_tested(self):
+        self.release_lifecycle(annotated=False)
+
+    def test_release_tag_conflict_preserves_existing_refs_and_work(self):
+        generated, tag = self.release_fixture()
+        self.maintenance_git('tag', '-a', tag, '-m', 'local tag to preserve')
+        (self.root / 'human.txt').write_text('staged maintenance work\n')
+        self.maintenance_git('add', 'human.txt')
+        refs = self.maintenance_git('show-ref')
+        status = self.maintenance_git('status', '--porcelain')
+        result = self.cli('branch', target=generated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('would clobber existing tag', result.stderr)
+        self.assertEqual(self.maintenance_git('show-ref'), refs)
+        self.assertEqual(self.maintenance_git('status', '--porcelain'), status)
+        self.assertFalse(generated.exists())
+
+    def test_concurrent_release_tag_creation_is_not_overwritten(self):
+        generated, tag = self.release_fixture()
+        original_git = patchset.git
+        concurrent_refs = []
+
+        def concurrent_tag(target, *args, **kwargs):
+            if target == self.root and args[0] == 'fetch':
+                self.maintenance_git('tag', tag)
+                concurrent_refs.append(self.maintenance_git('show-ref'))
+            return original_git(target, *args, **kwargs)
+
+        with mock.patch.object(patchset, 'git', side_effect=concurrent_tag):
+            with self.assertRaisesRegex(patchset.Failure, 'would clobber existing tag'):
+                patchset.branch(self.root, generated, self.manifest, self.manifest['patches'])
+        self.assertEqual(len(concurrent_refs), 1)
+        self.assertEqual(self.maintenance_git('show-ref'), concurrent_refs[0])
+        self.assertFalse(generated.exists())
+
+    def test_release_verification_rejects_missing_or_moved_tag(self):
+        generated, tag = self.release_fixture()
+        result = self.cli('branch', target=generated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        head = patchset.git(generated, 'rev-parse', 'HEAD')
+        ref = f'refs/tags/{tag}'
+        self.maintenance_git('update-ref', '-d', ref, self.git('rev-parse', ref).decode().strip())
+        for moved in (False, True):
+            if moved:
+                self.maintenance_git('tag', tag)
+            for action in ('verify', 'branch', 'test'):
+                with self.subTest(moved=moved, action=action):
+                    result = self.cli(action, target=generated)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('does not resolve to fixed base' if moved else 'rev-parse --verify',
+                                  result.stderr)
+                    self.assertNotIn('RUN:', result.stdout)
+        self.assertEqual(patchset.git(generated, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(patchset.git(generated, 'status', '--porcelain'), b'')
+
+    def test_branch_later_failure_creates_no_branch_or_partial_worktree(self):
+        generated = self.branch_fixture()
+        path = self.root / self.manifest['patches'][1]['patch']
+        path.write_text(path.read_text().replace('-first\n', '-conflict\n'))
+        result = self.cli('branch', target=generated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Preflight stopped at second', result.stderr)
+        self.assertFalse(generated.exists())
+        self.assertEqual(self.maintenance_git('branch', '--list', self.manifest['application']['branch']), b'')
+        self.assert_clean()
+
+    def test_new_patch_revision_keeps_previous_version_branch_intact(self):
+        generated = self.branch_fixture()
+        second = self.manifest['patches'].pop()
+        self.save()
+        self.assertEqual(self.cli('branch', target=generated).returncode, 0)
+        old_name = self.manifest['application']['branch']
+        old_head = self.maintenance_git('rev-parse', old_name)
+        self.manifest['patches'].append(second)
+        self.manifest['application']['branch'] += '-patchset-2'
+        self.save()
+        updated = generated.with_name('second-patch-version')
+        result = self.cli('branch', target=updated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((updated / 'file.txt').read_text(), 'second\n')
+        self.assertEqual((generated / 'file.txt').read_text(), 'first\n')
+        self.assertEqual(self.maintenance_git('rev-parse', old_name), old_head)
+        self.assertEqual(self.cli('test', target=updated).returncode, 0)
 
     def test_selection_includes_transitive_dependencies_once_in_manifest_order(self):
         self.add_patch('third', 'second', 'third', ['second'])
