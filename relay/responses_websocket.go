@@ -41,11 +41,12 @@ const responsesWSWriteTimeout = 30 * time.Second
 type ResponsesWSRequestRunner func(*http.Request, string, func(*gin.Context) *types.NewAPIError) *types.NewAPIError
 
 type responsesWSCreateEvent struct {
-	Type     string            `json:"type"`
-	EventID  string            `json:"event_id,omitempty"`
-	StreamID common.RawMessage `json:"stream_id,omitempty"`
-	Generate common.RawMessage `json:"generate,omitempty"`
-	Request  common.RawMessage `json:"response,omitempty"`
+	Type       string            `json:"type"`
+	EventID    string            `json:"event_id,omitempty"`
+	ResponseID string            `json:"response_id,omitempty"`
+	StreamID   common.RawMessage `json:"stream_id,omitempty"`
+	Generate   common.RawMessage `json:"generate,omitempty"`
+	Request    common.RawMessage `json:"response,omitempty"`
 }
 
 type responsesWSCreateRequest struct {
@@ -70,7 +71,7 @@ type responsesWSMessage struct {
 	err  error
 }
 
-// responsesWSControl is a client control event (response.cancel) whose
+// responsesWSControl is a client control event (response.cancel or response.interrupt) whose
 // envelope the read loop already parsed.
 type responsesWSControl struct {
 	body              []byte
@@ -107,13 +108,15 @@ type responsesWSSession struct {
 	unregister    func()
 	stateMu       sync.Mutex
 	current       *responsesWSCallState
+	// Connection history is guarded by stateMu and retained until disconnect.
+	finishedResponseIDs map[string]struct{}
+	controlEventIDs     map[string]struct{}
 
 	// clientWriteBudget is guarded by clientWriteMu.
 	clientWriteBudget helper.StreamWriteBudget
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
-	lastResponseID  string
 	lockedModel     string
 	lockedChannelID int
 	lockedGroup     string
@@ -126,7 +129,8 @@ type responsesWSSession struct {
 func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner) *types.NewAPIError {
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner,
-		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
+		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey),
+		finishedResponseIDs: make(map[string]struct{}), controlEventIDs: make(map[string]struct{})}
 	if s.requestID == "" {
 		s.requestID = common.NewRequestId()
 	}
@@ -154,10 +158,13 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 			continue
 		}
 		if eventType != responsesWSEventTypeResponseCreate {
-			// Controls are owned by the active request too. In particular a cancel
+			// Controls are owned by the active request too. In particular a control
 			// arriving during authentication must not precede its upstream create.
+			if eventType == "response.interrupt" && s.isObsoleteEvent(envelope.ResponseID, "", nil) {
+				continue
+			}
 			state := s.getCurrent()
-			if eventType != "response.cancel" || state == nil {
+			if (eventType != "response.cancel" && eventType != "response.interrupt") || state == nil {
 				s.sendError(envelope.EventID, streamID, newResponsesWSInvalidRequestError(fmt.Errorf("unsupported websocket event %q", eventType)))
 				continue
 			}
@@ -385,6 +392,13 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	var pendingControl []byte
 	var sentControl []byte
 	var responseID string
+	defer func() {
+		if responseID != "" {
+			s.stateMu.Lock()
+			s.finishedResponseIDs[responseID] = struct{}{}
+			s.stateMu.Unlock()
+		}
+	}()
 	for {
 		select {
 		case incoming := <-state.inbox:
@@ -398,26 +412,31 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info.SetFirstResponseTime()
 			var event struct {
 				dto.ResponsesStreamResponse
-				StreamID string `json:"stream_id"`
+				StreamID   string `json:"stream_id"`
+				ResponseID string `json:"response_id"`
 			}
 			if err := common.Unmarshal(incoming.body, &event); err != nil {
 				info.StreamStatus.RecordError("invalid upstream websocket event")
 			} else {
+				eventResponseID := event.ResponseID
+				if event.Response != nil && event.Response.ID != "" {
+					eventResponseID = event.Response.ID
+				}
+				// Deltas, usage, terminals and errors from any retired response
+				// must not enter the current response's accumulator.
+				if s.isObsoleteEvent(eventResponseID, "", nil) {
+					continue
+				}
 				if event.Type != "error" && event.StreamID != "" && event.StreamID != create.StreamID {
 					if err := s.writeClient(incoming.kind, incoming.body); err != nil {
 						s.shutdown(websocket.CloseInternalServerErr, "")
 					}
 					continue
 				}
-				// A repeated terminal from the previous response must never finish
-				// a subsequent request on this persistent connection.
-				if event.Response != nil && event.Response.ID != "" && event.Response.ID == s.lastResponseID {
-					continue
-				}
 				if event.Type == "error" {
 					var rejection responsesWSErrorEvent
 					_ = common.Unmarshal(incoming.body, &rejection)
-					if rejection.ResponseID != "" && rejection.ResponseID == s.lastResponseID {
+					if s.isObsoleteEvent(rejection.ResponseID, rejection.EventID, sentControl) {
 						continue
 					}
 					terminal, ambiguous, controlError := responsesWSErrorEndsRequest(rejection, create.StreamID, responseID, sentControl)
@@ -441,7 +460,6 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						}
 						accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
-						s.lastResponseID = responseID
 						state.terminal = &incoming
 						if ambiguous {
 							state.closeCode = websocket.CloseInternalServerErr
@@ -461,22 +479,25 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					return rejected
 				}
 				if strings.HasPrefix(event.Type, "response.") {
+					if responseID != "" && eventResponseID != "" && eventResponseID != responseID {
+						if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+							s.shutdown(websocket.CloseInternalServerErr, "")
+						}
+						continue
+					}
 					if !accepted {
 						// Like HTTP, bind the session only once upstream accepted the request.
 						service.RecordChannelAffinity(c, s.lockedChannelID)
 					}
 					accepted = true
-					if event.Response != nil && event.Response.ID != "" {
-						responseID = event.Response.ID
+					if eventResponseID != "" {
+						responseID = eventResponseID
 					}
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
-				if event.Response != nil {
-					s.lastResponseID = event.Response.ID
-				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				state.terminal = &incoming
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
@@ -486,7 +507,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			if accepted && pendingControl != nil {
-				if err := s.writeTarget(websocket.TextMessage, pendingControl); err != nil {
+				if err := s.writeControl(pendingControl); err != nil {
 					s.shutdown(websocket.CloseInternalServerErr, "")
 				}
 				sentControl = pendingControl
@@ -501,7 +522,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				pendingControl = control.body
 				continue
 			}
-			if err := s.writeTarget(websocket.TextMessage, control.body); err != nil {
+			if err := s.writeControl(control.body); err != nil {
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			sentControl = control.body
@@ -518,7 +539,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 }
 
-// A single generation is active, but a cancel can fail independently. Correlate
+// A single generation is active, but a control can fail independently. Correlate
 // available IDs first; uncorrelated control/server errors require a bounded
 // connection close because continuing could leave the generation stuck forever.
 func responsesWSErrorEndsRequest(event responsesWSErrorEvent, streamID, responseID string, control []byte) (terminal, ambiguous, controlError bool) {
@@ -535,7 +556,9 @@ func responsesWSErrorEndsRequest(event responsesWSErrorEvent, streamID, response
 		if event.ResponseID != "" && event.ResponseID == pending.ResponseID && event.ResponseID != responseID {
 			return false, false, true
 		}
-		if (event.StreamID == "" || event.StreamID == pending.StreamID) && event.Error != nil && event.Error.Type == "invalid_request_error" {
+		// A named generation failure takes precedence over a control-like code.
+		// Use the code fallback only when upstream supplied no correlation ID.
+		if event.EventID == "" && event.ResponseID == "" && (event.StreamID == "" || event.StreamID == pending.StreamID) && event.Error != nil && event.Error.Type == "invalid_request_error" {
 			switch event.Error.Code {
 			case "response_not_found", "response_not_active", "response_already_completed":
 				return false, false, true
@@ -663,6 +686,16 @@ func (s *responsesWSSession) startTargetReader(target *websocket.Conn) {
 				s.shutdown(code, "upstream connection closed")
 				return
 			}
+			var event struct {
+				EventID    string `json:"event_id"`
+				ResponseID string `json:"response_id"`
+				Response   struct {
+					ID string `json:"id"`
+				} `json:"response"`
+			}
+			if common.Unmarshal(body, &event) == nil && (s.isObsoleteEvent(event.ResponseID, event.EventID, nil) || s.isObsoleteEvent(event.Response.ID, "", nil)) {
+				continue
+			}
 			if writeErr := s.writeClient(kind, body); writeErr != nil {
 				s.shutdown(websocket.CloseInternalServerErr, "")
 				return
@@ -716,6 +749,28 @@ func (s *responsesWSSession) writeTarget(kind int, message []byte) error {
 		return err
 	}
 	return target.WriteMessage(kind, message)
+}
+
+func (s *responsesWSSession) writeControl(message []byte) error {
+	if err := s.writeTarget(websocket.TextMessage, message); err != nil {
+		return err
+	}
+	if eventID := ojson.GetBytesNoCopy(message, "event_id").String(); eventID != "" {
+		s.stateMu.Lock()
+		s.controlEventIDs[eventID] = struct{}{}
+		s.stateMu.Unlock()
+	}
+	return nil
+}
+
+// Only the outstanding control may resolve on a matching error. Retain prior
+// control IDs so a duplicate rejection cannot resolve a newer control or create.
+func (s *responsesWSSession) isObsoleteEvent(responseID, eventID string, control []byte) bool {
+	s.stateMu.Lock()
+	_, finished := s.finishedResponseIDs[responseID]
+	_, controlled := s.controlEventIDs[eventID]
+	s.stateMu.Unlock()
+	return finished || controlled && eventID != ojson.GetBytesNoCopy(control, "event_id").String()
 }
 
 func (s *responsesWSSession) writeClient(kind int, message []byte) error {
