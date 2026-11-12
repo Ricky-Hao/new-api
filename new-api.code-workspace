@@ -1,0 +1,6 @@
+{
+  "folders": [
+    { "name": "new-api maintenance", "path": "." },
+    { "name": "new-api application", "path": ".work/application" }
+  ]
+}

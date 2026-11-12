@@ -18,10 +18,37 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Open PRs test the normal merge preview; merged PRs test their final merge SHA.
-# All three jobs use that same immutable commit even if main advances.
+# Every job uses that same immutable maintenance commit even if main advances.
 jobs:
+  patchset:
+    name: Validate tools and generate application
+    if: github.event_name == 'pull_request' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      base: ${{ steps.generate.outputs.base }}
+      tree: ${{ steps.generate.outputs.tree }}
+    steps:
+      - name: Checkout exact maintenance revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Test maintenance tools
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
+      - name: Generate fixed application with complete patchset
+        id: generate
+        run: |
+          python3 tools/patchset.py generate --target .work/application
+          python3 -c "from tools.patchset import load_manifest; print('base=' + load_manifest()['base'])" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git -C .work/application write-tree)" >> "$GITHUB_OUTPUT"
+
   backend:
     name: Backend vet, build, and test
+    needs: patchset
     if: github.event_name == 'pull_request' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -36,55 +63,69 @@ jobs:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
+      - name: Reproduce validated application
+        env:
+          EXPECTED_BASE: ${{ needs.patchset.outputs.base }}
+          EXPECTED_TREE: ${{ needs.patchset.outputs.tree }}
+        run: |
+          python3 tools/patchset.py generate --target .work/application
+          test "$(git -C .work/application rev-parse HEAD)" = "$EXPECTED_BASE"
+          test "$(git -C .work/application write-tree)" = "$EXPECTED_TREE"
+
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version-file: .work/application/go.mod
           cache-dependency-path: |
-            go.sum
-            relaykit/go.sum
-            tokenkit/go.sum
+            .work/application/go.sum
+            .work/application/relaykit/go.sum
+            .work/application/tokenkit/go.sum
 
       - name: Create frontend embed placeholder
+        working-directory: .work/application
         run: |
           mkdir -p web/dist
           touch web/dist/index.html
 
       - name: Vet root module
+        working-directory: .work/application
         run: go vet ./...
 
       - name: Vet relaykit independently
-        working-directory: relaykit
+        working-directory: .work/application/relaykit
         run: go vet ./...
 
       - name: Vet tokenkit independently
-        working-directory: tokenkit
+        working-directory: .work/application/tokenkit
         run: go vet ./...
 
       - name: Build root module
+        working-directory: .work/application
         run: go build ./...
 
       - name: Build relaykit independently
-        working-directory: relaykit
+        working-directory: .work/application/relaykit
         run: go build ./...
 
       - name: Build tokenkit independently
-        working-directory: tokenkit
+        working-directory: .work/application/tokenkit
         run: go build ./...
 
       - name: Test root, relaykit, and tokenkit modules
+        working-directory: .work/application
         env:
           GOFLAGS: -timeout=20m
         run: make test
 
   frontend:
     name: Frontend typecheck and test
+    needs: patchset
     if: github.event_name == 'pull_request' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
       run:
-        working-directory: web
+        working-directory: .work/application/web
 
     steps:
       - name: Checkout
@@ -93,6 +134,16 @@ jobs:
           repository: ${{ github.event.pull_request.base.repo.full_name }}
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
+
+      - name: Reproduce validated application
+        working-directory: .
+        env:
+          EXPECTED_BASE: ${{ needs.patchset.outputs.base }}
+          EXPECTED_TREE: ${{ needs.patchset.outputs.tree }}
+        run: |
+          python3 tools/patchset.py generate --target .work/application
+          test "$(git -C .work/application rev-parse HEAD)" = "$EXPECTED_BASE"
+          test "$(git -C .work/application write-tree)" = "$EXPECTED_TREE"
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -110,7 +161,7 @@ jobs:
 
   image:
     name: Build, verify, and publish service image
-    needs: [backend, frontend]
+    needs: [patchset, backend, frontend]
     if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && github.repository == 'Ricky-Hao/new-api'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -138,7 +189,17 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           persist-credentials: false
 
+      - name: Reproduce validated application
+        env:
+          EXPECTED_BASE: ${{ needs.patchset.outputs.base }}
+          EXPECTED_TREE: ${{ needs.patchset.outputs.tree }}
+        run: |
+          python3 tools/patchset.py generate --target .work/application
+          test "$(git -C .work/application rev-parse HEAD)" = "$EXPECTED_BASE"
+          test "$(git -C .work/application write-tree)" = "$EXPECTED_TREE"
+
       - name: Set fork build version
+        working-directory: .work/application
         run: printf '%s\n' "$BUILD_VERSION" > VERSION
 
       - name: Set up Docker Buildx
@@ -147,7 +208,8 @@ jobs:
       - name: Build service image once and load locally
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: .
+          context: .work/application
+          file: .work/application/Dockerfile
           platforms: linux/amd64
           load: true
           push: false
@@ -157,6 +219,9 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.BUILD_SHA }}
             org.opencontainers.image.version=${{ env.BUILD_VERSION }}
+            io.new-api.patchset.revision=${{ env.BUILD_SHA }}
+            io.new-api.upstream.base=${{ needs.patchset.outputs.base }}
+            io.new-api.generated.tree=${{ needs.patchset.outputs.tree }}
 
       - name: Verify container startup
         timeout-minutes: 2
