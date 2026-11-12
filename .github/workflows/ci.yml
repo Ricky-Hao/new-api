@@ -163,9 +163,12 @@ jobs:
         run: |
           docker run --detach --name new-api-smoke \
             --publish 127.0.0.1:3000:3000 "$IMAGE:sha-$BUILD_SHA"
+          status_file=$(mktemp)
+          trap 'rm -f "$status_file"' EXIT
           curl --fail --silent --show-error --max-time 2 \
-            --retry 20 --retry-delay 2 --retry-connrefused \
-            http://127.0.0.1:3000/api/status | jq -e '.success == true'
+            --retry 20 --retry-delay 2 --retry-all-errors \
+            --output "$status_file" http://127.0.0.1:3000/api/status
+          jq -e -s 'length == 1 and .[0].success == true' "$status_file"
 
       - name: Clean up smoke container
         if: always()
