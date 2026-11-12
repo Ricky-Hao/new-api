@@ -157,8 +157,6 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.BUILD_SHA }}
             org.opencontainers.image.version=${{ env.BUILD_VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Verify container startup
         timeout-minutes: 2
