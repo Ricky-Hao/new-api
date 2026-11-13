@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "upstream": "https://github.com/QuantumNous/new-api.git",
+  "base": "f3d8b737b64842df0365c2a6696c276fbc409193",
+  "application": {
+    "ref": "f3d8b737b64842df0365c2a6696c276fbc409193",
+    "branch": "upstream-f3d8b737b"
+  },
+  "patches": [
+    {
+      "id": "response-interrupt",
+      "status": "keep",
+      "depends_on": [],
+      "patch": "patches/response-interrupt/changes.patch",
+      "paths": [
+        "controller/responses_websocket_test.go",
+        "relay/responses_websocket.go"
+      ],
+      "tests": "patches/response-interrupt/tests.json"
+    }
+  ]
+}

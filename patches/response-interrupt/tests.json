@@ -1,0 +1,11 @@
+{
+  "checks": [
+    {
+      "name": "Responses WebSocket interrupt regressions",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": ["go.mod", "controller/responses_websocket_test.go"],
+      "command": ["go", "test", "./controller", "-run", "^TestResponsesWebSocketInterrupt", "-count=1", "-v"]
+    }
+  ]
+}
